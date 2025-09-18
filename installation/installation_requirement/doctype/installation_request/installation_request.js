@@ -1,26 +1,37 @@
 // Copyright (c) 2025, shahil and contributors
 // For license information, please see license.txt
 
+
 frappe.ui.form.on("Installation Request", {
-    refresh: function(frm) {
-        if(frm.doc.docstatus == 1){
+     refresh: function(frm) {
+       
+        if(frm.doc.status){
+            let color = 'blue';
+            if(frm.doc.status === "Scheduled") color = 'orange';
+            else if(frm.doc.status === "Completed") color = 'green';
+            else if(frm.doc.status === "Cancelled") color = 'red';
+            frm.page.set_indicator(__(frm.doc.status), color);
+        }
+
+        if(frm.doc.docstatus == 1 && frm.doc.status !== "Scheduled"){
             frm.add_custom_button("Schedule Installation", function(){
-                frm.set_value("status", "Scheduled")
-                frm.save()
-                frappe.call({
-                    doc: frm.doc,  
-                    method: "scheduele_and_send_mail",
-                    callback:function(r){
-                        if(r.message){
-                            frappe.msgprint({title: __('Success'),
-                                            message: __('Email has been sent to technician and installation is scheduled'),
-                                            indicator: 'green'
-                                            });
+                frm.set_value("status", "Scheduled"); // update field
+                frm.save().then(() => {
+                    frappe.call({
+                        doc: frm.doc,  
+                        method: "scheduele_and_send_mail",
+                        callback:function(r){
+                            if(r.message){
+                                frappe.msgprint({
+                                    title: __('Success'),
+                                    message: __('Email has been sent to technician and installation is scheduled'),
+                                    indicator: 'green'
+                                });
+                            }
                         }
-                        
-                    }
-                })
-            })
+                    });
+                });
+            });
         }
     },
 	delivery_note:function(frm) {
@@ -40,7 +51,7 @@ frappe.ui.form.on("Installation Request", {
        
 	},
     
-   
+    
 
      on_submit: function(frm) {
         if (frm.doc.total_qty > 10) {
@@ -65,5 +76,4 @@ frappe.ui.form.on("Installation Request Items", {
         frm.set_value("total_quantity", tot);
     }
 });
-
 

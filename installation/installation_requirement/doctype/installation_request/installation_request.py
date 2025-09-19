@@ -1,6 +1,4 @@
-# Copyright (c) 2025, shahil and contributors
-# For license information, please see license.txt
-
+import json
 import frappe
 from frappe.model.document import Document
 from frappe.query_builder import DocType
@@ -8,38 +6,52 @@ from frappe.query_builder import DocType
 
 class InstallationRequest(Document):
 	def validate(self):
+		self.check_item_is_dn()
 		self.check_zero_qty()
-		
-	
-		
-	
+		total = sum([r.quantity for r in self.requested_items]) if self.requested_items else 0
+		frappe.db.set_value("Installation Request", self.name, "total_quantity", total)
+
+
 	def check_zero_qty(self):
-		for row in self.requested_items:
-			if row.quantity <=0 :
-				frappe.throw(f'<b>The qunatity must be greater than Zero</b>')
-	
+		for ri in self.requested_items:
+			if ri.quantity <= 0:
+				frappe.throw('<b>The quantity must be greater than Zero</b>')
+
+
+	def check_item_is_dn(self):
+		dn_items = frappe.db.get_all("Delivery Note Item", {"parent": self.delivery_note}, pluck="item_code") or []
+		dn_item_set = set(dn_items)
+		for ri in self.requested_items:
+			if ri.item_code not in dn_item_set:
+				frappe.throw(f'<b>{ri.item_code}</b> does not belong to given delivery note')
+
+
 	def before_save(self):
-		#add partial logic here
-		self.find_qty_current_allowed()
-		dni = frappe.db.get_all("Delivery Note Item", {"parent": self.delivery_note}, ["item_code", "qty"])
-		tot = 0
-		
-		#find currently against this delivery note which ir exists 
-		
-		
-		for row in dni:
-			if self.requested_items:
-				if row.item_code in [row.item_code for row in self.requested_items]:
-					continue
-			tot += row.get("qty")
-			self.append("requested_items", {
-					"item_code": row.get("item_code"),
-					"quantity": row.get("qty")
-			})
-		self.total_quantity = tot
+		self.is_qty_greater()
+		prior_qty, requested_qty, max_qty = self._compute_qty_maps()
+		dn_items = frappe.db.get_all("Delivery Note Item", {"parent": self.delivery_note}, ["item_code", "qty"]) or []
+		existing_request_item_codes = {r.item_code for r in self.requested_items}
+
+		for dn_row in dn_items:
+			item_code = dn_row.get("item_code")
+			allowed_total = dn_row.get("qty", 0)
+			already_installed = prior_qty.get(item_code, 0)
+			already_requested_in_doc = requested_qty.get(item_code, 0)
+			remaining_allowed = allowed_total - already_installed - already_requested_in_doc
+			
+			if item_code not in existing_request_item_codes and remaining_allowed > 0:
+				self.append("requested_items", {
+					"item_code": item_code,
+					"quantity": remaining_allowed
+				})
+
+		if not self.requested_items:
+			frappe.throw("No items Found, Already Installed Completely")
+
 	
 	@frappe.whitelist()
 	def scheduele_and_send_mail(self):
+		
 		table = """
 			<table border="1" cellspacing="0" cellpadding="5">
 				<tr>
@@ -54,9 +66,9 @@ class InstallationRequest(Document):
 			table += f"""
 				<tr>
 					<td>{row.item_code}</td>
-					<td>{row.get("roomlocation") or ""}</td>
+					<td>{row.get('roomlocation') or ""}</td>
 					<td>{row.quantity}</td>
-					<td><img src={row.get("image_link")} width=100px height=100px></img></td>
+					<td><img src="{row.get('image_link') or ''}" width="100" height="100" /></td>
 				</tr>
 			"""
 
@@ -69,56 +81,60 @@ class InstallationRequest(Document):
 		)
 
 		frappe.msgprint(f'MESSAGE SENT TO TECHNICIAN <b>{self.assigned_technician}</b>')
+
 	
-	def find_qty_current_allowed(self):
-		ireq =  frappe.db.get_all("Installation Request", {"delivery_note": self.delivery_note}, pluck="name")
-		ir = DocType("Installation Request")
-		iri = DocType("Installation Request Items")
+	def _compute_qty_maps(self):
+		prior_qty = {}
+		requested_qty = {}
+		max_qty = {}
 
-		ir_item_exist = (
-			frappe.qb.from_(ir).inner_join(iri)
-			.on((ir.name == iri.parent))
-			.select(iri.item_code, iri.quantity)
-			.where( (iri.parent.isin(ireq)) & (ir.delivery_note == self.delivery_note) &(ir.name != self.name))
-			.run(as_dict=1)
-		)
-		
-		grouped_per_item, no_irs = {}, True
-		
-		#per item total qty in all irs
-		
-		if ir_item_exist:
-			no_irs = False
-			for row in ir_item_exist:
-				key = row.get("item_code")
-				qty = row.get("quantity")
-				if key not in grouped_per_item:
-					grouped_per_item[key] = {"item_code": key, "qty": 0}
-				grouped_per_item[key]["qty"] += qty
+		ireq_names = frappe.db.get_all("Installation Request",
+									   filters={"delivery_note": self.delivery_note, "docstatus": 1},
+									   pluck="name") or []
 
-			
-		else:
-			for row in self.requested_items:
-				grouped_per_item[row.item_code] = {"item_code": row.item_code, "qty": row.quantity}
-		
-		dni = frappe.db.get_all("Delivery Note Item", {"parent": self.delivery_note}, ["item_code", "qty"])
-		violated_qty, err = {}, ""
-		
-		for row in dni:
-			item = row.item_code
-			max_qty = row.qty
-			curr_qty = grouped_per_item[item]["qty"]
-			grouped_per_item[item]["allowed_qty"] = max_qty - curr_qty
-			
-		for row in self.requested_items:
-			allowed = grouped_per_item[row.item_code]["allowed_qty"]
-			if row.quantity > allowed:
-				diff = row.quantity - allowed
-				err += (
-                	f' <b><i><span style="color:red;">Item {row.item_code}</span></i></b> '
-                	f'exceeds allowed quantity by <b>{diff}</b>.<br>'
-            	)
+		if getattr(self, "name", None):
+			ireq_names = [n for n in ireq_names if n != self.name]
 
-		if not err:
-			return
-		frappe.throw( "<b>The following items exceed their allowed quantities:</b><br><br>" + err)
+		if ireq_names:
+			ir = DocType("Installation Request")
+			iri = DocType("Installation Request Items")
+			rows = (
+				frappe.qb.from_(ir).inner_join(iri)
+				.on(iri.parent == ir.name)
+				.select(iri.item_code, iri.quantity)
+				.where((iri.parent.isin(ireq_names)) & (ir.delivery_note == self.delivery_note) & (ir.docstatus == 1))
+				.run(as_dict=True)
+			) or []
+			for r in rows:
+				key = r.get("item_code")
+				qty = r.get("quantity", 0) or 0
+				prior_qty.setdefault(key, 0)
+				prior_qty[key] += qty
+
+		for r in (self.requested_items or []):
+			requested_qty.setdefault(r.item_code, 0)
+			requested_qty[r.item_code] += (r.quantity or 0)
+
+		dn_rows = frappe.db.get_all("Delivery Note Item", {"parent": self.delivery_note}, ["item_code", "qty"]) or []
+		for r in dn_rows:
+			max_qty[r.get("item_code")] = r.get("qty", 0) or 0
+
+		return prior_qty, requested_qty, max_qty
+
+	
+	def is_qty_greater(self):
+		prior_qty, requested_qty, max_qty = self._compute_qty_maps()
+		errors = []
+
+		for r in (self.requested_items or []):
+			item = r.item_code
+			req_q = r.quantity or 0
+			allowed_total = max_qty.get(item, 0)
+			already_installed = prior_qty.get(item, 0)
+			allowed_now = allowed_total - already_installed
+			if req_q > allowed_now:
+				exceed_by = req_q - max(allowed_now, 0)
+				errors.append(f'Item <b>{item}</b> requested <b>{req_q}</b> which exceeds allowed remaining quantity by <b>{exceed_by}</b>')
+
+		if errors:
+			frappe.throw("<br>".join(errors))
